@@ -20,6 +20,9 @@ from mlflow.tracking import MlflowClient
 load_dotenv()
 
 MLFLOW_EXPERIMENT_NAME = "/Shared/klaudbiusz-evaluations"
+LEGACY_MLFLOW_EXPERIMENT_ALIASES = {
+    "/Shared/apps-mcp-evaluations": MLFLOW_EXPERIMENT_NAME,
+}
 
 class EvaluationTracker:
     """Track evaluation runs and metrics using MLflow."""
@@ -33,9 +36,11 @@ class EvaluationTracker:
                            uses MLFLOW_EXPERIMENT_NAME environment variable,
                            or defaults to MLFLOW_EXPERIMENT_NAME
         """
-        self.experiment_name = (
-            experiment_name or
-            os.environ.get('MLFLOW_EXPERIMENT_NAME', MLFLOW_EXPERIMENT_NAME)
+        requested_experiment = (
+            experiment_name or os.environ.get("MLFLOW_EXPERIMENT_NAME", MLFLOW_EXPERIMENT_NAME)
+        )
+        self.experiment_name = LEGACY_MLFLOW_EXPERIMENT_ALIASES.get(
+            requested_experiment, requested_experiment
         )
         self.client = None
         self.enabled = False

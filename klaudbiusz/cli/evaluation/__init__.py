@@ -6,7 +6,7 @@ High-level API for running evaluations:
 
     report = run_evaluation_simple(
         apps_dir="/Volumes/main/default/apps_mcp_generated",
-        mlflow_experiment="/Shared/apps-mcp-evaluations",
+        mlflow_experiment="/Shared/klaudbiusz-evaluations",
     )
 """
 

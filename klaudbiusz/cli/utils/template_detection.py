@@ -66,7 +66,27 @@ def _is_python_app(app_dir: Path) -> bool:
     has_requirements = (app_dir / "requirements.txt").exists()
     has_pyproject = (app_dir / "pyproject.toml").exists()
     has_no_package_json = not (app_dir / "package.json").exists()
-    return (has_requirements or has_pyproject) and has_no_package_json
+
+    if (has_requirements or has_pyproject) and has_no_package_json:
+        return True
+
+    # Heuristic for lightweight streamlit/python apps without requirements.txt:
+    # app sources in src/*.py and no Node package manifest.
+    src_dir = app_dir / "src"
+    has_py_sources = src_dir.exists() and any(src_dir.glob("*.py"))
+    if has_no_package_json and has_py_sources:
+        app_py = src_dir / "app.py"
+        if app_py.exists():
+            try:
+                content = app_py.read_text()
+                if "streamlit" in content or "import pandas" in content:
+                    return True
+            except Exception:
+                # If unreadable, still treat src/*.py layout as Python app.
+                return True
+        return True
+
+    return False
 
 
 def _is_dbx_sdk_app(app_dir: Path) -> bool:

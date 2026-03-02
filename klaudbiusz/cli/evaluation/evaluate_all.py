@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import fnmatch
 import json
+import shlex
 import sys
 import time
 from collections import Counter, defaultdict
@@ -173,6 +174,8 @@ def generate_summary_report(results: list[dict]) -> dict:
             # Metric 8-9: DevX
             "local_runability_avg": sum(r["metrics"]["local_runability_score"] for r in results) / total if total > 0 else 0,
             "deployability_avg": sum(r["metrics"]["deployability_score"] for r in results) / total if total > 0 else 0,
+            "local_runability_pass": sum(1 for r in results if r["metrics"]["local_runability_score"] >= 3),
+            "deployability_pass": sum(1 for r in results if r["metrics"]["deployability_score"] >= 3),
             # Metadata
             "total_loc": sum(r["metrics"]["total_loc"] for r in results),
             "avg_loc_per_app": sum(r["metrics"]["total_loc"] for r in results) / total if total > 0 else 0,
@@ -285,8 +288,9 @@ def generate_markdown_report(results: list[dict], summary: dict) -> str:
     md.append(f"- **UI Renders:** {metrics['ui_renders']}/{total} apps ({metrics['ui_renders']/total*100:.1f}%)")
 
     md.append("\n### Developer Experience (Metrics 8-9)")
-    md.append(f"- **Average Local Runability:** {metrics['local_runability_avg']:.1f}/5 ⭐")
-    md.append(f"- **Average Deployability:** {metrics['deployability_avg']:.1f}/5 ⭐")
+    md.append(f"- **Local Runability (PASS):** {metrics['local_runability_pass']}/{total} apps ({metrics['local_runability_pass']/total*100:.1f}%)")
+    md.append(f"- **Deployability (PASS):** {metrics['deployability_pass']}/{total} apps ({metrics['deployability_pass']/total*100:.1f}%)")
+    md.append(f"- **Legacy numeric averages (compat):** local={metrics['local_runability_avg']:.1f}/5, deploy={metrics['deployability_avg']:.1f}/5")
 
     md.append("\n### Code & Performance")
     md.append(f"- **Total Lines of Code:** {metrics['total_loc']:,}")
@@ -320,13 +324,28 @@ def generate_markdown_report(results: list[dict], summary: dict) -> str:
     md.append(f"- 🟠 **Fair** (3-4 issues): {len(qual['fair'])} apps ({len(qual['fair'])/total*100:.1f}%)")
     md.append(f"- 🔴 **Poor** (5+ issues): {len(qual['poor'])} apps ({len(qual['poor'])/total*100:.1f}%)")
 
-    # Developer Experience Scores
-    md.append("\n## Developer Experience (DevX) Scores\n")
-    devx = summary["devx_scores"]
-    md.append(f"- ⭐⭐⭐⭐⭐ **Excellent**: {len(devx['5_stars'])} apps (local ≥4, deploy ≥4)")
-    md.append(f"- ⭐⭐⭐⭐ **Good**: {len(devx['4_stars'])} apps (local ≥3, deploy ≥3)")
-    md.append(f"- ⭐⭐⭐ **Fair**: {len(devx['3_stars'])} apps (local ≥2, deploy ≥2)")
-    md.append(f"- ⭐⭐ **Needs Work**: {len(devx['2_stars'])} apps")
+    # Developer Experience status breakdown
+    md.append("\n## Developer Experience Status\n")
+    both_pass = []
+    local_only_pass = []
+    deploy_only_pass = []
+    both_fail = []
+    for r in results:
+        app_name = r["app_name"]
+        local_pass = r["metrics"]["local_runability_score"] >= 3
+        deploy_pass = r["metrics"]["deployability_score"] >= 3
+        if local_pass and deploy_pass:
+            both_pass.append(app_name)
+        elif local_pass:
+            local_only_pass.append(app_name)
+        elif deploy_pass:
+            deploy_only_pass.append(app_name)
+        else:
+            both_fail.append(app_name)
+    md.append(f"- **PASS/PASS:** {len(both_pass)} apps")
+    md.append(f"- **PASS/FAIL:** {len(local_only_pass)} apps")
+    md.append(f"- **FAIL/PASS:** {len(deploy_only_pass)} apps")
+    md.append(f"- **FAIL/FAIL:** {len(both_fail)} apps")
 
     # Common Issues
     md.append("\n## Most Common Issues\n")
@@ -346,10 +365,10 @@ def generate_markdown_report(results: list[dict], summary: dict) -> str:
         for app in excellent[:10]:  # Top 10
             md.append(f"- `{app}`")
 
-    # Highest DevX scores
-    top_devx = devx['5_stars']
+    # Best DevX outcomes
+    top_devx = both_pass
     if top_devx:
-        md.append("\n### ⭐ Best Developer Experience\n")
+        md.append("\n### ✅ Best Developer Experience\n")
         for app in top_devx[:10]:
             md.append(f"- `{app}`")
 
@@ -484,11 +503,14 @@ def generate_markdown_report(results: list[dict], summary: dict) -> str:
     # Positive highlights
     md.append("\n## Highlights ✨\n")
 
-    if metrics['deployability_avg'] >= 4:
-        md.append(f"- 🎉 **Strong deployability**: Average score of {metrics['deployability_avg']:.1f}/5")
+    deploy_pass_rate = (metrics["deployability_pass"] / summary["total_apps"] * 100) if summary["total_apps"] > 0 else 0
+    local_pass_rate = (metrics["local_runability_pass"] / summary["total_apps"] * 100) if summary["total_apps"] > 0 else 0
 
-    if metrics['local_runability_avg'] >= 3:
-        md.append(f"- 👍 **Good local development setup**: Average score of {metrics['local_runability_avg']:.1f}/5")
+    if deploy_pass_rate >= 70:
+        md.append(f"- 🎉 **Strong deployability**: PASS rate {deploy_pass_rate:.1f}%")
+
+    if local_pass_rate >= 70:
+        md.append(f"- 👍 **Good local development setup**: PASS rate {local_pass_rate:.1f}%")
 
     if len(excellent) > 0:
         md.append(f"- 🏆 **{len(excellent)} apps with zero issues** - excellent quality!")
@@ -738,6 +760,154 @@ def filter_app_dirs(app_dirs: list[Path], args) -> list[Path]:
     return filtered
 
 
+def _looks_like_app_dir(directory: Path) -> bool:
+    """Heuristic: directory contains app-like markers."""
+    markers = [
+        "package.json",
+        "app.py",
+        "requirements.txt",
+        "pyproject.toml",
+        "Dockerfile",
+        "databricks.yml",
+        "server",
+        "client",
+        "src",
+    ]
+    return any((directory / marker).exists() for marker in markers)
+
+
+def _expand_collection_dirs(app_dirs: list[Path]) -> list[Path]:
+    """Expand bulk-run collection folders into contained app directories.
+
+    Some archives are organized as:
+      app-opencode-sonnet-databricks/
+        bulk_run_results_*.json
+        <many app folders>/
+
+    Evaluating the collection root causes agentic checks to run in the wrong folder.
+    """
+    expanded: list[Path] = []
+    excluded_dirs = {"logs", "node_modules", "__pycache__", ".git", "screenshot_output"}
+
+    for app_dir in app_dirs:
+        has_bulk_results = bool(list(app_dir.glob("bulk_run_results_*.json")))
+        child_dirs = [
+            d
+            for d in sorted(app_dir.iterdir())
+            if d.is_dir() and not d.name.startswith(".") and d.name not in excluded_dirs
+        ]
+        child_app_dirs = [d for d in child_dirs if _looks_like_app_dir(d)]
+
+        if has_bulk_results and child_app_dirs:
+            print(
+                f"🔎 '{app_dir.name}' is a collection folder; "
+                f"expanding to {len(child_app_dirs)} contained apps"
+            )
+            expanded.extend(child_app_dirs)
+        else:
+            expanded.append(app_dir)
+
+    # Keep deterministic order and remove duplicates by path.
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for d in expanded:
+        key = str(d.resolve())
+        if key not in seen:
+            seen.add(key)
+            deduped.append(d)
+    return deduped
+
+
+def _describe_eval_approach(args) -> dict[str, object]:
+    """Describe evaluator approach for this run."""
+    execution_mode = "local-no-dagger" if args.no_dagger else "dagger-containerized"
+    checks_mode = "fast" if args.fast else "full"
+    return {
+        "approach_version": "agentic-v2",
+        "execution_mode": execution_mode,
+        "checks_mode": checks_mode,
+        "agentic_metrics": [
+            "build",
+            "runtime",
+            "type_safety",
+            "tests",
+            "db_connectivity",
+            "data_returned",
+            "ui_renders",
+            "local_runability",
+            "deployability",
+        ],
+        "eval_agent_model": "haiku",
+        "notes": [
+            "Collection folders are expanded into contained app directories before skip/limit.",
+            "Runability/deployability/data-returned run 3 attempts with turn/token telemetry.",
+            "Pass/fail parsing uses STATUS markers first, with strict fallback inference.",
+        ],
+    }
+
+
+def _build_run_metadata(
+    run_id: str,
+    eval_duration: float,
+    args,
+    app_dirs: list[Path],
+    apps_dir: Path,
+    run_config: dict[str, str],
+) -> dict[str, object]:
+    """Build structured metadata for one evaluation run."""
+    cli_command = " ".join(shlex.quote(part) for part in sys.argv)
+    selected_app_names = [d.name for d in app_dirs]
+    selected_app_dirs = [str(d.resolve()) for d in app_dirs]
+    approach = _describe_eval_approach(args)
+    return {
+        "run_id": run_id,
+        "created_at_utc": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "eval_duration_sec": round(eval_duration, 3),
+        "cli_command": cli_command,
+        "cwd": str(Path.cwd()),
+        "apps_root": str(apps_dir.resolve()),
+        "selected_app_count": len(selected_app_names),
+        "selected_apps": selected_app_names,
+        "selected_app_dirs": selected_app_dirs,
+        "cli_args": vars(args),
+        "generation_run_config": run_config,
+        "effective_models": {
+            "generation_model": run_config.get("model"),
+            "generation_backend": run_config.get("backend"),
+            "evaluation_agent_model": "haiku",
+        },
+        "approach": approach,
+    }
+
+
+def _write_approach_markdown(path: Path, metadata: dict[str, object]) -> None:
+    """Write human-readable approach summary for this run."""
+    approach = metadata.get("approach", {})
+    if not isinstance(approach, dict):
+        approach = {}
+
+    lines = [
+        f"# Evaluation Approach ({metadata.get('run_id', 'unknown')})",
+        "",
+        f"- **Execution mode:** `{approach.get('execution_mode', 'unknown')}`",
+        f"- **Checks mode:** `{approach.get('checks_mode', 'unknown')}`",
+        f"- **Approach version:** `{approach.get('approach_version', 'unknown')}`",
+        f"- **Evaluation agent model:** `{approach.get('eval_agent_model', 'unknown')}`",
+        "",
+        "## Agentic Metrics",
+    ]
+    for metric in approach.get("agentic_metrics", []):
+        lines.append(f"- `{metric}`")
+
+    notes = approach.get("notes", [])
+    if notes:
+        lines.extend(["", "## Notes"])
+        for note in notes:
+            lines.append(f"- {note}")
+
+    path.write_text("\n".join(lines) + "\n")
+
+
 async def _save_results_and_log_mlflow(
     results: list,
     app_dirs: list,
@@ -745,6 +915,8 @@ async def _save_results_and_log_mlflow(
     eval_duration: float,
     script_dir: Path,
     gen_metrics: dict,
+    run_config: dict[str, str],
+    apps_dir: Path,
 ):
     """Save results to files and log to MLflow. Extracted to call from both local and Dagger paths."""
     print("\n" + "=" * 60)
@@ -759,33 +931,37 @@ async def _save_results_and_log_mlflow(
     summary = generate_summary_report(valid_results)
     markdown = generate_markdown_report(valid_results, summary)
 
-    # Determine output paths - save to app-eval directory
+    # Determine output paths - save each run into app-eval/runs/<run_id>
     output_dir = script_dir.parent / "app-eval"
     output_dir.mkdir(exist_ok=True)
+    runs_dir = output_dir / "runs"
+    runs_dir.mkdir(exist_ok=True)
 
-    # Rename existing evaluation files before creating new ones
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    old_files = [
-        (output_dir / "evaluation_report.json", f"evaluation_report_{timestamp}.json"),
-        (output_dir / "evaluation_report.csv", f"evaluation_report_{timestamp}.csv"),
-        (output_dir / "EVALUATION_REPORT.md", f"EVALUATION_REPORT_{timestamp}.md"),
-    ]
+    run_dir = runs_dir / timestamp
+    run_dir.mkdir(exist_ok=True)
 
-    for old_file, new_name in old_files:
-        if old_file.exists():
-            renamed = old_file.parent / new_name
-            old_file.rename(renamed)
-            print(f"  Preserved: {old_file.name} → {new_name}")
-
-    json_output = output_dir / "evaluation_report.json"
-    md_output = output_dir / "EVALUATION_REPORT.md"
+    json_output = run_dir / "evaluation_report.json"
+    md_output = run_dir / "EVALUATION_REPORT.md"
+    csv_output = run_dir / "evaluation_report.csv"
+    metadata_output = run_dir / "run_metadata.json"
+    approach_output = run_dir / "approach.md"
 
     # Save full results
+    run_metadata = _build_run_metadata(
+        run_id=timestamp,
+        eval_duration=eval_duration,
+        args=args,
+        app_dirs=app_dirs,
+        apps_dir=apps_dir,
+        run_config=run_config,
+    )
     full_report = {
         "summary": summary,
         "apps": valid_results,
         "timestamp": timestamp,
         "evaluation_run_id": timestamp,
+        "run_metadata": run_metadata,
     }
     json_output.write_text(json.dumps(full_report, indent=2))
     print(f"✓ JSON report saved: {json_output}")
@@ -795,10 +971,18 @@ async def _save_results_and_log_mlflow(
     print(f"✓ Markdown report saved: {md_output}")
 
     # Save CSV report
-    csv_output = output_dir / "evaluation_report.csv"
     csv_content = generate_csv_report(valid_results)
     csv_output.write_text(csv_content)
     print(f"✓ CSV report saved: {csv_output}")
+
+    metadata_output.write_text(json.dumps(run_metadata, indent=2))
+    print(f"✓ Run metadata saved: {metadata_output}")
+    _write_approach_markdown(approach_output, run_metadata)
+    print(f"✓ Approach notes saved: {approach_output}")
+
+    latest_pointer = output_dir / "LATEST_RUN.txt"
+    latest_pointer.write_text(str(run_dir) + "\n")
+    print(f"✓ Latest run pointer updated: {latest_pointer}")
 
     # Log to MLflow
     print("\n📊 Logging to MLflow...")
@@ -832,11 +1016,21 @@ async def _save_results_and_log_mlflow(
             run_id = tracker.start_run(run_name=run_name, tags=tags)
 
             # Log parameters
+            effective_models = run_metadata.get("effective_models", {})
+            if not isinstance(effective_models, dict):
+                effective_models = {}
+            approach_info = run_metadata.get("approach", {})
+            if not isinstance(approach_info, dict):
+                approach_info = {}
             params = {
                 "mode": "evaluation",
                 "total_apps": summary['total_apps'],
                 "timestamp": timestamp,
-                "model_version": "claude-sonnet-4-5-20250929",
+                "eval_agent_model": effective_models.get("evaluation_agent_model") or "unknown",
+                "generation_model": effective_models.get("generation_model") or "unknown",
+                "generation_backend": effective_models.get("generation_backend") or "unknown",
+                "execution_mode": approach_info.get("execution_mode") or "unknown",
+                "checks_mode": approach_info.get("checks_mode") or "unknown",
             }
 
             tracker.log_evaluation_parameters(**params)
@@ -848,6 +1042,8 @@ async def _save_results_and_log_mlflow(
             tracker.log_artifact_file(str(json_output))
             tracker.log_artifact_file(str(md_output))
             tracker.log_artifact_file(str(csv_output))
+            tracker.log_artifact_file(str(metadata_output))
+            tracker.log_artifact_file(str(approach_output))
 
             # Log trajectory files for each app
             print("📝 Logging trajectories...")
@@ -916,8 +1112,8 @@ async def _save_results_and_log_mlflow(
     print(f"  7. UI Renders:            {metrics['ui_renders']}/{total} ({metrics['ui_renders']/total*100:.0f}%)")
 
     print("\nDeveloper Experience:")
-    print(f"  8. Local Runability:      {metrics['local_runability_avg']:.1f}/5 ⭐")
-    print(f"  9. Deployability:         {metrics['deployability_avg']:.1f}/5 ⭐")
+    print(f"  8. Local Runability:      PASS {metrics['local_runability_pass']}/{total} ({metrics['local_runability_pass']/total*100:.0f}%)")
+    print(f"  9. Deployability:         PASS {metrics['deployability_pass']}/{total} ({metrics['deployability_pass']/total*100:.0f}%)")
 
     print("\nQuality Distribution:")
     qual = summary["quality_distribution"]
@@ -927,12 +1123,13 @@ async def _save_results_and_log_mlflow(
     print(f"  🔴 Poor:      {len(qual['poor'])}")
 
     print(f"\n📄 Full report: {md_output}")
+    print(f"📁 Run directory: {run_dir}")
 
     # Generate interactive HTML viewer
     print("\n🌐 Generating interactive HTML viewer...")
     try:
         from generate_eval_viewer import generate_html_viewer
-        html_output = output_dir / "evaluation_viewer.html"
+        html_output = run_dir / "evaluation_viewer.html"
         generate_html_viewer(json_output, html_output)
         print(f"✓ HTML viewer: {html_output}")
         print(f"\n🎉 Open in browser: file://{html_output.absolute()}")
@@ -982,8 +1179,25 @@ async def main_async():
         if d.is_dir() and not d.name.startswith(".") and d.name not in excluded_dirs
     ]
 
-    # Filter based on command-line arguments
-    app_dirs = filter_app_dirs(all_app_dirs, args)
+    # Apply name/pattern filtering first (on top-level directories).
+    top_level_filter_args = argparse.Namespace(**vars(args))
+    top_level_filter_args.skip = None
+    top_level_filter_args.limit = None
+    top_level_filter_args.start_from = None
+    app_dirs = filter_app_dirs(all_app_dirs, top_level_filter_args)
+
+    # Expand wrapper/collection dirs so each evaluation receives a real app folder.
+    app_dirs = _expand_collection_dirs(app_dirs)
+
+    # Apply windowing filters after expansion so --skip/--limit work on real app dirs.
+    post_expand_filter_args = argparse.Namespace(
+        apps=None,
+        pattern=None,
+        start_from=args.start_from,
+        skip=args.skip,
+        limit=args.limit,
+    )
+    app_dirs = filter_app_dirs(app_dirs, post_expand_filter_args)
 
     # Auto-detect CPU count if --parallel 0
     import os as os_module
@@ -1165,14 +1379,14 @@ async def main_async():
             # Generate reports INSIDE dagger context (before cleanup hangs)
             eval_duration = time.time() - eval_start_time
             await _save_results_and_log_mlflow(
-                results, app_dirs, args, eval_duration, script_dir, gen_metrics
+                results, app_dirs, args, eval_duration, script_dir, gen_metrics, run_config, apps_dir
             )
         return  # Exit early after Dagger path
 
     # Local evaluation path - save results
     eval_duration = time.time() - eval_start_time
     await _save_results_and_log_mlflow(
-        results, app_dirs, args, eval_duration, script_dir, gen_metrics
+        results, app_dirs, args, eval_duration, script_dir, gen_metrics, run_config, apps_dir
     )
 
 

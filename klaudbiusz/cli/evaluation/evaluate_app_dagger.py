@@ -24,16 +24,20 @@ from dotenv import load_dotenv
 from cli.evaluation.evaluate_app import (
     EvalResult,
     FullMetrics,
+    _prepare_runtime_env,
+    check_databricks_connectivity_agentic,
     check_data_validity_llm,
-    check_databricks_connectivity,
-    check_deployability,
-    check_local_runability,
-    check_ui_functional_vlm,
+    check_data_returned_agentic,
+    check_deployability_agentic,
+    check_local_runability_agentic,
+    check_ui_renders_agentic,
     load_prompts_from_bulk_results,
 )
+from cli.evaluation.eval_agent import EvalAgent
 from cli.utils.template_detection import detect_template, get_actual_app_dir
 from cli.utils.ts_workspace import (
     build_app,
+    capture_screenshot,
     check_runtime,
     check_types,
     create_ts_workspace,
@@ -59,6 +63,9 @@ for env_path in env_paths:
     if env_path.exists():
         load_dotenv(env_path, override=True)
         break
+
+# Global kill switch: skip DB connectivity/data-returned checks in all runs.
+SKIP_DB_CONNECTIVITY_CHECKS = os.environ.get("EVAL_SKIP_DB_CONNECTIVITY", "1") != "0"
 
 
 def _restore_terminal_cursor() -> None:
@@ -251,31 +258,74 @@ async def evaluate_app_async(
         # Remaining checks run on host (not in Dagger)
         # These are slow (LLM/VLM calls) and can be skipped with --fast flag
 
-        # Metric 5: Databricks connectivity (only if runtime succeeded)
+        # Capture screenshot if runtime succeeded (needed for UI check)
+        if runtime_success and not fast_mode:
+            print("  [5/8] Capturing screenshot...")
+            await capture_screenshot(workspace, app_dir, port)
+
+        # Metric 5-6 can be globally skipped to avoid harness-level DB timeouts.
         if fast_mode:
             print("  [5-7/7] Skipping DB/data/UI checks (--fast mode)")
+        elif SKIP_DB_CONNECTIVITY_CHECKS:
+            print("  [5-6/7] Skipping DB/data checks (EVAL_SKIP_DB_CONNECTIVITY=1)")
+            details["databricks_connectivity_agentic"] = [
+                "Skipped by evaluator config (EVAL_SKIP_DB_CONNECTIVITY=1)"
+            ]
+            details["data_returned_agentic"] = [
+                "Skipped because DB connectivity checks are disabled"
+            ]
         elif runtime_success:
-            print("  [5/7] Checking Databricks connectivity...")
-            db_success = check_databricks_connectivity(app_dir, template, port)
+            db_success, db_details = await check_databricks_connectivity_agentic(
+                devx_agent if 'devx_agent' in locals() else EvalAgent(
+                    actual_app_dir,
+                    model="haiku",
+                    suppress_logs=True,
+                    env=_prepare_runtime_env(actual_app_dir, port=port),
+                ),
+                actual_app_dir,
+                template,
+                port,
+            )
             metrics.databricks_connectivity = db_success
+            details["databricks_connectivity_agentic"] = [db_details]
             if not db_success:
                 issues.append("Databricks connectivity failed")
 
             # Metric 6: Data validity (LLM)
             if db_success:
-                data_returned, data_details = check_data_validity_llm(app_dir, prompt, template)
+                runtime_env = _prepare_runtime_env(actual_app_dir, port=port)
+                data_agent = EvalAgent(
+                    actual_app_dir, model="haiku", suppress_logs=True, env=runtime_env
+                )
+                data_returned, data_details = await check_data_returned_agentic(
+                    data_agent,
+                    actual_app_dir,
+                    template,
+                    port=port,
+                )
                 metrics.data_returned = data_returned
+                details["data_returned_agentic"] = [data_details]
                 if not data_returned:
                     issues.append(f"Data validity concerns: {data_details}")
 
             # Metric 7: UI functional (VLM)
-            print("  [7/7] Checking UI renders (VLM)...")
-            ui_renders, ui_details = check_ui_functional_vlm(app_dir, prompt)
+            ui_renders, ui_details = await check_ui_renders_agentic(
+                data_agent if 'data_agent' in locals() else EvalAgent(
+                    actual_app_dir,
+                    model="haiku",
+                    suppress_logs=True,
+                    env=_prepare_runtime_env(actual_app_dir, port=port),
+                ),
+                actual_app_dir,
+                template,
+                port,
+            )
             metrics.ui_renders = ui_renders
+            details["ui_renders_agentic"] = [ui_details]
             if not ui_renders:
                 issues.append(f"UI concerns: {ui_details}")
         else:
-            print("  [5-7/7] Skipping DB/data/UI checks (runtime failed)")
+            print("  [5-8/8] Skipping DB/data/UI checks (runtime failed)")
 
     except Exception as e:
         issues.append(f"Evaluation error: {str(e)}")
@@ -283,8 +333,14 @@ async def evaluate_app_async(
 
     # Calculate DevX metrics (run even if evaluation failed)
     try:
+        # Metric 8-9: Agentic DevX checks (run on host against app directory)
+        runtime_env = _prepare_runtime_env(actual_app_dir, port=port + 200)
+        devx_agent = EvalAgent(actual_app_dir, model="haiku", suppress_logs=True, env=runtime_env)
+
         # Metric 8: Local runability
-        local_score, local_details = check_local_runability(app_dir, template)
+        local_score, local_details = await check_local_runability_agentic(
+            devx_agent, actual_app_dir, template, port=port + 200
+        )
         metrics.local_runability_score = local_score
         details["local_runability"] = local_details
         if local_score < 3:
@@ -293,7 +349,9 @@ async def evaluate_app_async(
             )
 
         # Metric 9: Deployability
-        deploy_score, deploy_details = check_deployability(app_dir)
+        deploy_score, deploy_details = await check_deployability_agentic(
+            devx_agent, actual_app_dir, template, port=port + 300
+        )
         metrics.deployability_score = deploy_score
         details["deployability"] = deploy_details
         if deploy_score < 3:

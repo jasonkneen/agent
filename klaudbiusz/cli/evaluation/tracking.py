@@ -47,7 +47,7 @@ def setup_mlflow(
         True if MLflow is enabled and configured, False otherwise.
 
     Example:
-        if setup_mlflow("/Shared/apps-mcp-evaluations"):
+        if setup_mlflow("/Shared/klaudbiusz-evaluations"):
             print("MLflow ready!")
     """
     global _mlflow_configured, _experiment_name
