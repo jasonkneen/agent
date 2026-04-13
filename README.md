@@ -28,7 +28,7 @@ Some tools for bulk app generation and evaluation of this version are available 
 - OCI-compatible container runtime (Docker, OrbStack, Podman...) must be installed and running for Dagger-based sandboxed execution
 
 ```
-curl -LsSf https://raw.githubusercontent.com/appdotbuild/agent/refs/heads/main/edda/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/neondatabase/appdotbuild-agent/refs/heads/main/edda/install.sh | sh
 ```
 and attach to your favorite MCP client, e.g. Claude Code:
 ```
